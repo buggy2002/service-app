@@ -8,7 +8,9 @@
     "start": "next start",
     "lint": "eslint",
     "db:push": "drizzle-kit push",
-    "db:generate": "drizzle-kit generate"
+    "db:generate": "drizzle-kit generate",
+    "airtable:setup": "tsx scripts/setup-airtable.ts",
+    "airtable:seed": "tsx scripts/seed-airtable.ts"
   },
   "dependencies": {
     "airtable": "^0.12.2",

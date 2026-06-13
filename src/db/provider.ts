@@ -1,7 +1,7 @@
 import { db as mssqlDb } from "./index";
 import { companies, products, warranties, services, users, serviceParts, technicians } from "./schema";
 import { eq, sql, desc, like, or, inArray, exists } from "drizzle-orm";
-import { airtableBase, TABLES } from "./airtable";
+import { airtableBase, TABLES, type FieldSet } from "./airtable";
 import { 
     TUser, TNewUser, 
     TCompany, TNewCompany, 
@@ -14,7 +14,6 @@ import {
     TTechnician, TNewTechnician,
     TCompanyInput, TProductInput, TWarrantyInput, TServiceInput
 } from "@/types/database";
-import { FieldSet } from "airtable";
 import { formatDate } from "@/lib/utils";
 
 const isAirtable = process.env.DB_TYPE === 'airtable';
@@ -39,12 +38,25 @@ function cleanDataForAirtable(data: Record<string, unknown>): FieldSet {
     return cleaned as unknown as FieldSet;
 }
 
+function escapeAirtableFormulaValue(value: string): string {
+    return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+function isMissingAirtableComputedFieldError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return [
+        "latestWarrantyEndDate",
+        "warrantyStatus",
+        "isNearExpiry",
+    ].some((fieldName) => message.includes(`Unknown field name: "${fieldName}"`));
+}
+
 export const dataProvider = {
     // === USERS ===
     async findUserByUsername(username: string) {
         if (isAirtable) {
             const records = await airtableBase(TABLES.USERS).select({
-                filterByFormula: `{username} = '${username}'`,
+                filterByFormula: `{username} = '${escapeAirtableFormulaValue(username)}'`,
                 maxRecords: 1
             }).firstPage();
             if (records.length === 0) return null;
@@ -170,7 +182,7 @@ export const dataProvider = {
     async findCompanyByName(name: string) {
         if (isAirtable) {
             const records = await airtableBase(TABLES.COMPANIES).select({
-                filterByFormula: `{name} = '${name.replace(/'/g, "\\'")}'`,
+                filterByFormula: `{name} = '${escapeAirtableFormulaValue(name)}'`,
                 maxRecords: 1
             }).firstPage();
             if (records.length === 0) return null;
@@ -223,6 +235,90 @@ export const dataProvider = {
         const { query, status, page = 1, pageSize = 50 } = options;
 
         if (isAirtable) {
+            const buildFallbackProducts = async () => {
+                const searchFilter = query
+                    ? `OR(SEARCH('${query.toLowerCase()}', LOWER({name})), SEARCH('${query.toLowerCase()}', LOWER({serialNumber})))`
+                    : undefined;
+
+                const records = await airtableBase(TABLES.PRODUCTS).select(
+                    searchFilter ? { filterByFormula: searchFilter } : {}
+                ).all();
+
+                const productIds = records.map((record) => record.id);
+                const allWarranties = await this.getAllWarrantiesForProducts(productIds);
+
+                const relevantCompanyIds = [...new Set(records.map((record) => {
+                    const companyId = record.fields.companyId;
+                    return Array.isArray(companyId) ? companyId[0] : companyId;
+                }).filter(Boolean) as string[])];
+
+                let companyRecords: readonly { id: string; fields: FieldSet }[] = [];
+                if (relevantCompanyIds.length > 0) {
+                    const companyFilter = `OR(${relevantCompanyIds.map(id => `RECORD_ID()='${id}'`).join(',')})`;
+                    companyRecords = await airtableBase(TABLES.COMPANIES).select({
+                        filterByFormula: companyFilter
+                    }).all();
+                }
+
+                const now = new Date();
+                const thirtyDaysLater = new Date(now);
+                thirtyDaysLater.setDate(thirtyDaysLater.getDate() + 30);
+
+                const computedProducts = records.map((record) => {
+                    const fields = record.fields as FieldSet;
+                    const companyId = Array.isArray(fields.companyId) ? fields.companyId[0] : (fields.companyId as string);
+                    const company = companyRecords.find(c => c.id === companyId);
+                    const warranties = allWarranties
+                        .filter(warranty => String(warranty.productId) === String(record.id))
+                        .map(warranty => warranty as unknown as TWarranty)
+                        .sort((a, b) => new Date(a.endDate).getTime() - new Date(b.endDate).getTime());
+                    const latestWarranty = warranties[warranties.length - 1] || null;
+
+                    let airtableWarrantyStatus = '⚠️ No Warranty';
+                    let isNearExpiry = false;
+
+                    if (latestWarranty?.endDate) {
+                        const endDate = new Date(latestWarranty.endDate);
+                        if (!isNaN(endDate.getTime())) {
+                            if (endDate < now) {
+                                airtableWarrantyStatus = '❌ Expired';
+                            } else {
+                                airtableWarrantyStatus = '✅ Active';
+                                isNearExpiry = endDate <= thirtyDaysLater;
+                            }
+                        }
+                    }
+
+                    return {
+                        ...fields,
+                        id: record.id,
+                        companyId,
+                        companyName: company ? (company.fields as FieldSet).name as string : 'Unknown',
+                        airtableWarrantyStatus,
+                        isNearExpiry,
+                        latestWarranty,
+                    } as unknown as IProductWithLatestWarranty;
+                });
+
+                const filteredProducts = computedProducts.filter((product) => {
+                    if (!status || status === 'all') return true;
+                    if (status === 'active') return product.airtableWarrantyStatus === '✅ Active' && !product.isNearExpiry;
+                    if (status === 'near_expiry') return Boolean(product.isNearExpiry);
+                    if (status === 'expired') return product.airtableWarrantyStatus === '❌ Expired' || product.airtableWarrantyStatus === '⚠️ No Warranty';
+                    return true;
+                });
+
+                filteredProducts.sort((a, b) => {
+                    const aTime = a.latestWarranty?.endDate ? new Date(a.latestWarranty.endDate).getTime() : Number.MAX_SAFE_INTEGER;
+                    const bTime = b.latestWarranty?.endDate ? new Date(b.latestWarranty.endDate).getTime() : Number.MAX_SAFE_INTEGER;
+                    return aTime - bTime;
+                });
+
+                const totalCount = filteredProducts.length;
+                const pageData = filteredProducts.slice((page - 1) * pageSize, page * pageSize);
+                return { data: pageData, totalCount };
+            };
+
             const filterParts = [];
             
             // 1. Search Filter
@@ -265,7 +361,15 @@ export const dataProvider = {
                 selectOptions.filterByFormula = filterFormula;
             }
 
-            const records = await airtableBase(TABLES.PRODUCTS).select(selectOptions).all();
+            let records: readonly { id: string; fields: FieldSet }[];
+            try {
+                records = await airtableBase(TABLES.PRODUCTS).select(selectOptions).all();
+            } catch (error) {
+                if (!isMissingAirtableComputedFieldError(error)) {
+                    throw error;
+                }
+                return await buildFallbackProducts();
+            }
 
             // We also need a total count for pagination UI. 
             // Fetching ALL just to count is slow. Let's do a separate small request for total count logic if needed,
@@ -275,7 +379,15 @@ export const dataProvider = {
             if (filterFormula) {
                 countOptions.filterByFormula = filterFormula;
             }
-            const allIds = await airtableBase(TABLES.PRODUCTS).select(countOptions).all();
+            let allIds: readonly { id: string; fields: FieldSet }[];
+            try {
+                allIds = await airtableBase(TABLES.PRODUCTS).select(countOptions).all();
+            } catch (error) {
+                if (!isMissingAirtableComputedFieldError(error)) {
+                    throw error;
+                }
+                return await buildFallbackProducts();
+            }
             const totalCount = allIds.length;
 
             const pageData = records.slice((page - 1) * pageSize, page * pageSize);
@@ -508,7 +620,7 @@ export const dataProvider = {
         if (isAirtable) {
             try {
                 const records = await airtableBase(TABLES.SERVICES).select({
-                    filterByFormula: `{order_case} = '${orderCase}'`
+                    filterByFormula: `{order_case} = '${escapeAirtableFormulaValue(orderCase)}'`
                 }).all();
 
                 if (records.length === 0) return [];
@@ -804,7 +916,7 @@ export const dataProvider = {
             if (isAirtable) {
                 console.log(`Syncing parts for Order Case: ${orderCase}`, parts);
                 const existing = await airtableBase(TABLES.SERVICE_PARTS).select({
-                    filterByFormula: `{order_case} = '${orderCase}'`
+                    filterByFormula: `{order_case} = '${escapeAirtableFormulaValue(orderCase)}'`
                 }).all();
                 
                 if (existing.length > 0) {

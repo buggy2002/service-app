@@ -1,5 +1,6 @@
 import { dataProvider } from "@/db/provider";
 import { getSession } from "@/lib/auth";
+import { hasPermission } from "@/lib/permissions";
 import { redirect, notFound } from "next/navigation";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import {
@@ -38,6 +39,7 @@ export default async function ProductDetailPage({
   if (!session) redirect("/login");
 
   const { id: productId } = await params;
+  const canCreateWarranty = hasPermission(session.role, "warranty", "create");
   const product = (await dataProvider.getProductById(productId)) as TProduct;
   if (!product) notFound();
 
@@ -133,7 +135,7 @@ export default async function ProductDetailPage({
               </div>
               <CardTitle className="text-xl">สถานะการรับประกัน / MA</CardTitle>
             </div>
-            <AddWarrantyDialog productId={productId} />
+            {canCreateWarranty ? <AddWarrantyDialog productId={productId} /> : null}
           </CardHeader>
           <CardContent className="p-0">
             {productWarranties.length === 0 ? (
